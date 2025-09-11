@@ -355,6 +355,4 @@ class RotaryEmbedding(nnx.Module):
         cos = jnp.cos(emb).astype(self.dtype)
         sin = jnp.sin(emb).astype(self.dtype)
 
-        print(f"Cos shape {cos.shape} and Sin shape {sin.shape}")
-
         return cos, sin
