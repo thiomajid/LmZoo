@@ -241,6 +241,8 @@ class ZooModel(nnx.Module):
                 param_dtype,
             )
 
+            jax.debug.print("{name} instance has been created", name=cls.__name__)
+
             with ocp.CheckpointManager(local_dir) as mngr:
                 jax.debug.print("=" * 30)
                 jax.debug.print(
@@ -255,7 +257,6 @@ class ZooModel(nnx.Module):
                 #     return x.update(sharding=NamedSharding(mesh, spec))
 
                 # new_topology_state = jax.tree.map(set_sharding, abstract_state)
-
                 jax.debug.print("=" * 30)
                 jax.debug.print("Restoring checkpoint state")
                 restored = mngr.restore(
