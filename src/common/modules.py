@@ -51,7 +51,7 @@ class RMSNorm(nnx.Module):
     ):
         scale_init = nnx.with_partitioning(
             initializers.ones_init(),
-            sharding=shardings.rms_norm_weight,
+            sharding=shardings.rms_norm_scale,
         )
 
         self.scale = nnx.Param(scale_init(rngs(), (num_features,), param_dtype))
