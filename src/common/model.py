@@ -146,7 +146,7 @@ class ZooModel(nnx.Module):
         param_dtype=jnp.float32,
     ):
         @partial(
-            jax.jit,
+            nnx.jit,
             static_argnames=("config", "shardings", "dtype", "param_dtype"),
         )
         def create_sharded_model(
@@ -200,7 +200,7 @@ class ZooModel(nnx.Module):
         config = AutoConfig.from_pretrained(local_dir)
 
         @partial(
-            jax.jit,
+            nnx.jit,
             static_argnames=("config", "shardings", "dtype", "param_dtype"),
         )
         def create_sharded_model(
