@@ -146,32 +146,38 @@ class ZooModel(nnx.Module):
         param_dtype=jnp.float32,
     ):
         @partial(
-            jax.jit,
-            static_argnames=("seed", "config", "shardings", "dtype", "param_dtype"),
+            nnx.jit,
+            static_argnames=("seed", "config_fn", "shardings", "dtype", "param_dtype"),
         )
         def create_sharded_model(
             seed: int,
             shardings: BaseModelShardingConfig,
-            config: AutoConfig,
+            config_fn: tp.Callable[[], AutoConfig],
             dtype=jnp.bfloat16,
             param_dtype=jnp.float32,
         ):
             rngs = nnx.Rngs(seed)
             model = cls(
-                config,
+                config_fn(),
                 rngs=rngs,
                 shardings=shardings,
                 dtype=dtype,
                 param_dtype=param_dtype,
             )
 
-            return model
+            return model, rngs
 
         model: tp.Self
         with jax.set_mesh(mesh):
-            model = create_sharded_model(seed, shardings, config, dtype, param_dtype)
+            model, rngs = create_sharded_model(
+                seed,
+                shardings,
+                lambda: config,
+                dtype,
+                param_dtype,
+            )
 
-        return model
+        return model, rngs
 
     @classmethod
     def from_pretrained(
@@ -201,30 +207,36 @@ class ZooModel(nnx.Module):
         config = AutoConfig.from_pretrained(local_dir)
 
         @partial(
-            jax.jit,
-            static_argnames=("seed", "config", "shardings", "dtype", "param_dtype"),
+            nnx.jit,
+            static_argnames=("seed", "config_fn", "shardings", "dtype", "param_dtype"),
         )
         def create_sharded_model(
             seed: int,
             shardings: BaseModelShardingConfig,
-            config: AutoConfig,
+            config_fn: tp.Callable[[], AutoConfig],
             dtype=jnp.bfloat16,
             param_dtype=jnp.float32,
         ):
             rngs = nnx.Rngs(seed)
             model = cls(
-                config,
+                config_fn(),
                 rngs=rngs,
                 shardings=shardings,
                 dtype=dtype,
                 param_dtype=param_dtype,
             )
 
-            return model
+            return model, rngs
 
         model: tp.Self
         with jax.set_mesh(mesh):
-            model = create_sharded_model(seed, shardings, config, dtype, param_dtype)
+            model, rngs = create_sharded_model(
+                seed,
+                shardings,
+                lambda: config,
+                dtype,
+                param_dtype,
+            )
 
             with ocp.CheckpointManager(local_dir) as mngr:
                 abstract_model = nnx.eval_shape(lambda: model)
@@ -242,4 +254,4 @@ class ZooModel(nnx.Module):
 
             nnx.update(model, restored)
 
-        return model
+        return model, rngs
