@@ -52,11 +52,11 @@ class Qwen3RMSNorm(RMSNorm):
         self,
         num_features,
         *,
-        shardings,
         rngs,
         dtype=jnp.bfloat16,
         param_dtype=jnp.float32,
         epsilon=0.000001,
+        shardings=Qwen3ShardingConfig.get_default_sharding(),
     ):
         super().__init__(
             num_features,
@@ -70,10 +70,20 @@ class Qwen3RMSNorm(RMSNorm):
 
 class Qwen3MLP(SwigluMLP):
     def __init__(
-        self, config, *, shardings, rngs, dtype=jnp.bfloat16, param_dtype=jnp.float32
+        self,
+        config,
+        *,
+        rngs,
+        dtype=jnp.bfloat16,
+        param_dtype=jnp.float32,
+        shardings=Qwen3ShardingConfig.get_default_sharding(),
     ):
         super().__init__(
-            config, shardings=shardings, rngs=rngs, dtype=dtype, param_dtype=param_dtype
+            config,
+            shardings=shardings,
+            rngs=rngs,
+            dtype=dtype,
+            param_dtype=param_dtype,
         )
 
 
@@ -83,10 +93,10 @@ class Qwen3MultiHeadAttention(MultiHeadAttention):
         config,
         layer_idx,
         *,
-        shardings,
         rngs,
         dtype=jnp.bfloat16,
         param_dtype=jnp.float32,
+        shardings=Qwen3ShardingConfig.get_default_sharding(),
     ):
         super().__init__(
             config,
@@ -104,10 +114,10 @@ class Qwen3DecoderLayer(TransformerDecoderLayer):
         config,
         layer_idx,
         *,
-        shardings,
         rngs,
         dtype=jnp.bfloat16,
         param_dtype=jnp.float32,
+        shardings=Qwen3ShardingConfig.get_default_sharding(),
     ):
         super().__init__(
             config,
@@ -167,6 +177,7 @@ class Qwen3Model(nnx.Module):
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             rngs=rngs,
+            shardings=shardings,
             dtype=dtype,
             param_dtype=param_dtype,
         )
