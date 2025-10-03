@@ -155,6 +155,7 @@ class Qwen3Model(nnx.Module):
                 layer_idx,
                 rngs=rngs,
                 dtype=dtype,
+                shardings=shardings,
                 param_dtype=param_dtype,
             )
             for layer_idx in range(config.num_hidden_layers)
