@@ -169,6 +169,9 @@ class ZooModel(nnx.Module):
 
         model: tp.Self
         with jax.set_mesh(mesh):
+            jax.debug.print("=" * 30)
+            jax.debug.print("Creating {name} model", name=cls.__name__)
+
             model, rngs = create_sharded_model(
                 seed,
                 shardings,
@@ -176,6 +179,8 @@ class ZooModel(nnx.Module):
                 dtype,
                 param_dtype,
             )
+
+            jax.debug.print("{name} instance has been created", name=cls.__name__)
 
         return model, rngs
 

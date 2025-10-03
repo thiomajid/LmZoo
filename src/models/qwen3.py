@@ -21,6 +21,7 @@ from src.common.types import ShardingRule
 from src.inference import GenerationMixin
 
 
+
 # adapted from https://github.com/google/tunix/blob/main/tunix/models/llama3/model.py
 @dataclass(slots=True, frozen=True)
 class Qwen3ShardingConfig(BaseModelShardingConfig):
