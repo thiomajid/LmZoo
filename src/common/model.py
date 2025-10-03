@@ -8,7 +8,6 @@ import numpy as np
 import orbax.checkpoint as ocp
 from flax import nnx
 from huggingface_hub import snapshot_download
-from jax.sharding import NamedSharding
 from transformers import AutoConfig
 
 from src.common.sharding import BaseModelShardingConfig
@@ -231,6 +230,9 @@ class ZooModel(nnx.Module):
 
         model: tp.Self
         with jax.set_mesh(mesh):
+            jax.debug.print("=" * 30)
+            jax.debug.print("Creating {name} model", name=cls.__name__)
+
             model, rngs = create_sharded_model(
                 seed,
                 shardings,
@@ -240,16 +242,24 @@ class ZooModel(nnx.Module):
             )
 
             with ocp.CheckpointManager(local_dir) as mngr:
-                graphdef, abstract_state = nnx.get_abstract_model(lambda: model)
+                jax.debug.print("=" * 30)
+                jax.debug.print(
+                    "Ensuring that the sharding matches the current device topology"
+                )
 
-                # handle device topology changes
-                def set_sharding(x: jax.ShapeDtypeStruct):
-                    spec = x.sharding.spec
-                    return x.update(sharding=NamedSharding(mesh, spec))
+                # `get_abstract_model` handles device topology changes
+                graphdef, abstract_state = nnx.get_abstract_model(lambda: model, mesh)
 
-                new_topology_state = jax.tree.map(set_sharding, abstract_state)
+                # def set_sharding(x: jax.ShapeDtypeStruct):
+                #     spec = x.sharding.spec
+                #     return x.update(sharding=NamedSharding(mesh, spec))
+
+                # new_topology_state = jax.tree.map(set_sharding, abstract_state)
+
+                jax.debug.print("=" * 30)
+                jax.debug.print("Restoring checkpoint state")
                 restored = mngr.restore(
-                    checkpoint_step, args=ocp.args.StandardRestore(new_topology_state)
+                    checkpoint_step, args=ocp.args.StandardRestore(abstract_state)
                 )
 
             nnx.update(model, restored)
