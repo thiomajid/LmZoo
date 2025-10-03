@@ -10,6 +10,8 @@ from flax import nnx
 from huggingface_hub import snapshot_download
 from transformers import AutoConfig
 
+from src.common.sharding import BaseModelShardingConfig
+
 
 def stack_layers(layers: tp.Sequence[nnx.Module]) -> nnx.Module:
     """Stack the modules into a single module with batched parameters"""
@@ -138,8 +140,8 @@ class ZooModel(nnx.Module):
         config: AutoConfig,
         *,
         rngs: nnx.Rngs,
-        shardings: tp.Any,
         mesh: jax.sharding.Mesh,
+        shardings=BaseModelShardingConfig.get_default_sharding(),
         dtype=jnp.bfloat16,
         param_dtype=jnp.float32,
     ):
@@ -202,16 +204,16 @@ class ZooModel(nnx.Module):
             static_argnames=("config", "shardings", "dtype", "param_dtype"),
         )
         def create_sharded_model(
-            rngs=rngs,
-            shardings=shardings,
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
+            rngs: nnx.Rngs,
+            shardings: BaseModelShardingConfig,
+            config: AutoConfig,
+            dtype=jnp.bfloat16,
+            param_dtype=jnp.float32,
         ):
             model = cls(
                 config,
-                shardings=shardings,
                 rngs=rngs,
+                shardings=shardings,
                 dtype=dtype,
                 param_dtype=param_dtype,
             )
@@ -220,7 +222,7 @@ class ZooModel(nnx.Module):
 
         model: tp.Self
         with jax.set_mesh(mesh):
-            model = create_sharded_model()
+            model = create_sharded_model(rngs, shardings, config, dtype, param_dtype)
 
             with ocp.CheckpointManager(local_dir) as mngr:
                 abstract_model = nnx.eval_shape(lambda: model)
