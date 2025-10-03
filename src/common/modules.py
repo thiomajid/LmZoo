@@ -245,6 +245,7 @@ class MultiHeadAttention(nnx.Module):
         self.param_dtype = param_dtype
         self.promote_dtype = dtypes.promote_dtype
 
+    @jax.named_scope("MultiHeadAttention")
     def __call__(
         self,
         hidden_states: jax.Array,
@@ -339,6 +340,7 @@ class TransformerDecoderLayer(nnx.Module):
         self.post_attention_layernorm = Norm()
         self.attention_type = config.layer_types[layer_idx]
 
+    @jax.named_scope("TransformerDecoderLayer")
     def __call__(
         self,
         hidden_states: jax.Array,
@@ -395,6 +397,7 @@ class RotaryEmbedding(nnx.Module):
         # Store as a non-trainable buffer
         self.inv_freq = inv_freq
 
+    @jax.named_scope("RoPE")
     def __call__(self, position_ids: jax.Array):
         # position_ids: [batch_size, seq_len]
         t = position_ids.astype(self.inv_freq.dtype)

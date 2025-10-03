@@ -8,6 +8,7 @@ import numpy as np
 import orbax.checkpoint as ocp
 from flax import nnx
 from huggingface_hub import snapshot_download
+from jax.sharding import NamedSharding
 from transformers import AutoConfig
 
 from src.common.sharding import BaseModelShardingConfig
@@ -239,17 +240,16 @@ class ZooModel(nnx.Module):
             )
 
             with ocp.CheckpointManager(local_dir) as mngr:
-                abstract_model = nnx.eval_shape(lambda: model)
-                graphdef, abstract_state = nnx.split(abstract_model)
+                graphdef, abstract_state = nnx.get_abstract_model(lambda: model)
 
-                # abstract_state = jax.tree.map(
-                #     lambda a, s: jax.ShapeDtypeStruct(a.shape, a.dtype, sharding=s),
-                #     abstract_state,
-                #     nnx.get_named_sharding(abstract_state, mesh),
-                # )
+                # handle device topology changes
+                def set_sharding(x: jax.ShapeDtypeStruct):
+                    spec = x.sharding.spec
+                    return x.update(sharding=NamedSharding(mesh, spec))
 
+                new_topology_state = jax.tree.map(set_sharding, abstract_state)
                 restored = mngr.restore(
-                    checkpoint_step, args=ocp.args.StandardRestore(abstract_state)
+                    checkpoint_step, args=ocp.args.StandardRestore(new_topology_state)
                 )
 
             nnx.update(model, restored)
