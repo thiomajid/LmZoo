@@ -1,25 +1,50 @@
 import typing as tp
+from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
 from flax.nnx import initializers
 from flax.nnx.nn.linear import default_embed_init
-from jax.sharding import Mesh
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from src.common.model import ZooModel, stack_layers
 from src.common.modules import (
-    MLP,
-    DecoderLayer,
     MultiHeadAttention,
     RMSNorm,
     RotaryEmbedding,
+    SwigluMLP,
+    TransformerDecoderLayer,
 )
+from src.common.sharding import BaseModelShardingConfig
+from src.common.types import ShardingRule
 from src.inference import GenerationMixin
 
-PositionEmbeddings = tuple[jax.Array, jax.Array]
-"""Cosine and sinus arrays for RoPE"""
+
+# adapted from https://github.com/google/tunix/blob/main/tunix/models/llama3/model.py
+@dataclass(slots=True, frozen=True)
+class Qwen3ShardingConfig(BaseModelShardingConfig):
+    act_btd: ShardingRule
+    act_btf: ShardingRule
+    act_btnh: ShardingRule
+
+    @staticmethod
+    def get_default_sharding(is_sampling: bool = False):
+        fsdp = "fsdp" if not is_sampling else None
+
+        return Qwen3ShardingConfig(
+            embedding=("tp", fsdp),
+            lm_head=(fsdp, "tp"),
+            attn_q_weight=("tp", fsdp, None),
+            attn_kv_weight=("tp", fsdp, None),
+            attn_o_weight=("tp", None, fsdp),
+            ffn_up_proj=(fsdp, "tp"),
+            ffn_down_proj=("tp", fsdp),
+            rms_norm_scale=("tp",),
+            act_btd=("fsdp", None, None if is_sampling else "tp"),
+            act_btf=("fsdp", None, "tp"),
+            act_btnh=("fsdp", None, "tp", None),
+        )
 
 
 class Qwen3RMSNorm(RMSNorm):
@@ -27,7 +52,7 @@ class Qwen3RMSNorm(RMSNorm):
         self,
         num_features,
         *,
-        mesh,
+        shardings,
         rngs,
         dtype=jnp.bfloat16,
         param_dtype=jnp.float32,
@@ -35,7 +60,7 @@ class Qwen3RMSNorm(RMSNorm):
     ):
         super().__init__(
             num_features,
-            mesh=mesh,
+            shardings=shardings,
             rngs=rngs,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -43,32 +68,22 @@ class Qwen3RMSNorm(RMSNorm):
         )
 
 
-class Qwen3MLP(MLP):
+class Qwen3MLP(SwigluMLP):
     def __init__(
-        self,
-        config,
-        *,
-        mesh,
-        rngs,
-        dtype=jnp.bfloat16,
-        param_dtype=jnp.float32,
+        self, config, *, shardings, rngs, dtype=jnp.bfloat16, param_dtype=jnp.float32
     ):
         super().__init__(
-            config,
-            mesh=mesh,
-            rngs=rngs,
-            dtype=dtype,
-            param_dtype=param_dtype,
+            config, shardings=shardings, rngs=rngs, dtype=dtype, param_dtype=param_dtype
         )
 
 
-class Qwen3Attention(MultiHeadAttention):
+class Qwen3MultiHeadAttention(MultiHeadAttention):
     def __init__(
         self,
         config,
         layer_idx,
         *,
-        mesh,
+        shardings,
         rngs,
         dtype=jnp.bfloat16,
         param_dtype=jnp.float32,
@@ -76,20 +91,20 @@ class Qwen3Attention(MultiHeadAttention):
         super().__init__(
             config,
             layer_idx,
-            mesh=mesh,
+            shardings=shardings,
             rngs=rngs,
             dtype=dtype,
             param_dtype=param_dtype,
         )
 
 
-class Qwen3DecoderLayer(DecoderLayer):
+class Qwen3DecoderLayer(TransformerDecoderLayer):
     def __init__(
         self,
         config,
         layer_idx,
         *,
-        mesh,
+        shardings,
         rngs,
         dtype=jnp.bfloat16,
         param_dtype=jnp.float32,
@@ -97,7 +112,7 @@ class Qwen3DecoderLayer(DecoderLayer):
         super().__init__(
             config,
             layer_idx,
-            mesh=mesh,
+            shardings=shardings,
             rngs=rngs,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -114,10 +129,10 @@ class Qwen3Model(nnx.Module):
         self,
         config: Qwen3Config,
         *,
-        mesh: Mesh,
         rngs: nnx.Rngs,
         dtype=jnp.bfloat16,
         param_dtype=jnp.float32,
+        shardings=Qwen3ShardingConfig.get_default_sharding(),
     ):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -131,15 +146,13 @@ class Qwen3Model(nnx.Module):
             param_dtype=param_dtype,
             embedding_init=nnx.with_partitioning(
                 default_embed_init,
-                sharding=(None, "tp"),
-                mesh=mesh,
+                sharding=shardings.embedding,
             ),
         )
         layers = [
             Qwen3DecoderLayer(
                 config,
                 layer_idx,
-                mesh=mesh,
                 rngs=rngs,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -152,7 +165,6 @@ class Qwen3Model(nnx.Module):
         self.norm = Qwen3RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
-            mesh=mesh,
             rngs=rngs,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -241,18 +253,18 @@ class Qwen3ForCausalLM(ZooModel, GenerationMixin):
         self,
         config: Qwen3Config,
         *,
-        mesh: Mesh,
         rngs: nnx.Rngs,
         dtype=jnp.bfloat16,
         param_dtype=jnp.float32,
+        shardings=Qwen3ShardingConfig.get_default_sharding(),
     ):
         self.vocab_size = config.vocab_size
         self.PARAMS_MAPPING = create_causal_lm_params_mapping(config)
 
         self.model = Qwen3Model(
             config,
-            mesh=mesh,
             rngs=rngs,
+            shardings=shardings,
             dtype=dtype,
             param_dtype=param_dtype,
         )
@@ -266,8 +278,7 @@ class Qwen3ForCausalLM(ZooModel, GenerationMixin):
             param_dtype=param_dtype,
             kernel_init=nnx.with_partitioning(
                 initializers.lecun_normal(),
-                sharding=(None, "tp"),
-                mesh=mesh,
+                sharding=shardings.lm_head,
             ),
         )
 

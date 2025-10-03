@@ -35,7 +35,7 @@ def stack_layers(layers: tp.Sequence[nnx.Module]) -> nnx.Module:
     return stacked_layers
 
 
-def unstack_layers(layers: nnx.Module, num_hidden_layers: int) -> tuple[nnx.Module]:
+def unstack_layers(layers: nnx.Module, num_hidden_layers: int) -> nnx.List[nnx.Module]:
     """
     Reverses the stacking operation to retrieve a list of individual layer modules.
 
@@ -65,27 +65,12 @@ def unstack_layers(layers: nnx.Module, num_hidden_layers: int) -> tuple[nnx.Modu
         layer_i = nnx.merge(graphdef, param_state_i)
         reconstructed_layers.append(layer_i)
 
-    return tuple(reconstructed_layers)
-
-
-class SequentialWrapper(nnx.Module):
-    def __init__(self, modules: tp.Sequence[nnx.Module]):
-        self.num_modules = len(modules)
-
-        for idx in range(self.num_modules):
-            setattr(self, str(idx), modules[idx])
-
-    def collect(self) -> tp.Sequence[nnx.Module]:
-        modules = []
-        for idx in range(self.num_modules):
-            modules.append(getattr(self, str(idx)))
-
-        return modules
+    return nnx.List(reconstructed_layers)
 
 
 class VmappableLayersMixin:
     num_hidden_layers: int
-    layers: tp.Union[nnx.Module, SequentialWrapper]
+    layers: tp.Union[nnx.Module, nnx.List]
 
     def stack_layers(self):
         """
@@ -93,13 +78,12 @@ class VmappableLayersMixin:
         to allow inference with a function wrapped with nnx.scan
         """
 
-        layers_sequence = self.layers.collect()
-
+        layers_sequence = self.layers
         assert len(layers_sequence) == self.num_hidden_layers, (
             f"The SequentialWrapper has {len(layers_sequence)} modules while the model expects {self.num_hidden_layers} modules"
         )
 
-        #! delete sequential layers from model's state to avoid conflicts
+        #! set sequential layers to None to avoid state conflicts or mixed values in model state
         self.layers = None
         self.layers = stack_layers(layers_sequence)
 
@@ -116,17 +100,19 @@ class VmappableLayersMixin:
 
         #! need to set it to None, otherwise Flax will merge the states of both batched and sequential layers
         self.layers = None
-        self.layers = SequentialWrapper(layers_seq)
+        self.layers = layers_seq
 
 
 class ZooModel(nnx.Module):
     PARAMS_MAPPING: dict
 
     def create_state_from_numpy_weights(
-        self, state_dict: dict[str, np.ndarray]
+        self,
+        state_dict: dict[str, np.ndarray],
     ) -> nnx.State:
         def _load_weights(path, leaf):
-            full_path = ".".join(map(lambda p: p.key, path[:-1]))
+            # stop at path[:-1] to not include the ".value" of each nnx.Param object
+            full_path = ".".join(map(lambda p: str(p.key), path[:-1]))
             torch_key = self.PARAMS_MAPPING.get(full_path, None)
             if torch_key is None:
                 return leaf
@@ -136,7 +122,7 @@ class ZooModel(nnx.Module):
                 if weight.ndim == 2:  # standard linear layer
                     return jnp.array(weight.T)
                 else:
-                    # something like a convolution module
+                    # something like a convolution kernel
                     # torch has the in_features as last dimension while Flax
                     # always has the out_features on the trailing axis
                     return jnp.array(weight.swapaxes(-1, -2))
@@ -147,12 +133,51 @@ class ZooModel(nnx.Module):
         return updated_state
 
     @classmethod
+    def from_config(
+        cls,
+        config: AutoConfig,
+        *,
+        rngs: nnx.Rngs,
+        shardings: tp.Any,
+        mesh: jax.sharding.Mesh,
+        dtype=jnp.bfloat16,
+        param_dtype=jnp.float32,
+    ):
+        @partial(
+            jax.jit,
+            static_argnames=("config", "shardings", "dtype", "param_dtype"),
+        )
+        def create_sharded_model(
+            rngs=rngs,
+            shardings=shardings,
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+        ):
+            model = cls(
+                config,
+                shardings=shardings,
+                rngs=rngs,
+                dtype=dtype,
+                param_dtype=param_dtype,
+            )
+
+            return model
+
+        model: tp.Self
+        with jax.set_mesh(mesh):
+            model = create_sharded_model()
+
+        return model
+
+    @classmethod
     def from_pretrained(
         cls,
         repo_id: str,
         *,
         local_dir: Path,
         rngs: nnx.Rngs,
+        shardings: tp.Any,
         mesh: jax.sharding.Mesh,
         checkpoint_step: int = 0,
         dtype=jnp.bfloat16,
@@ -171,50 +196,46 @@ class ZooModel(nnx.Module):
         )
 
         config = AutoConfig.from_pretrained(local_dir)
-        model: ZooModel
 
-        @partial(nnx.jit, static_argnames=("config_fn", "mesh", "dtype", "param_dtype"))
+        @partial(
+            jax.jit,
+            static_argnames=("config", "shardings", "dtype", "param_dtype"),
+        )
         def create_sharded_model(
-            rngs: nnx.Rngs,
-            config_fn,
-            mesh=mesh,
+            rngs=rngs,
+            shardings=shardings,
+            config=config,
             dtype=dtype,
             param_dtype=param_dtype,
         ):
             model = cls(
-                config_fn(),
-                mesh=mesh,
+                config,
+                shardings=shardings,
                 rngs=rngs,
                 dtype=dtype,
                 param_dtype=param_dtype,
             )
 
-            state = nnx.state(model)
-            pspecs = nnx.get_partition_spec(
-                state
-            )  # Strip out the annotations from state.
-            sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
-            nnx.update(model, sharded_state)
-
             return model
 
-        with mesh:
-            model = create_sharded_model(rngs, lambda: config)
+        model: tp.Self
+        with jax.set_mesh(mesh):
+            model = create_sharded_model()
 
-        with ocp.CheckpointManager(local_dir) as mngr:
-            abstract_model = nnx.eval_shape(lambda: model)
-            graphdef, abstract_state = nnx.split(abstract_model)
+            with ocp.CheckpointManager(local_dir) as mngr:
+                abstract_model = nnx.eval_shape(lambda: model)
+                graphdef, abstract_state = nnx.split(abstract_model)
 
-            # abstract_state = jax.tree.map(
-            #     lambda a, s: jax.ShapeDtypeStruct(a.shape, a.dtype, sharding=s),
-            #     abstract_state,
-            #     nnx.get_named_sharding(abstract_state, mesh),
-            # )
+                # abstract_state = jax.tree.map(
+                #     lambda a, s: jax.ShapeDtypeStruct(a.shape, a.dtype, sharding=s),
+                #     abstract_state,
+                #     nnx.get_named_sharding(abstract_state, mesh),
+                # )
 
-            restored = mngr.restore(
-                checkpoint_step, args=ocp.args.StandardRestore(abstract_state)
-            )
+                restored = mngr.restore(
+                    checkpoint_step, args=ocp.args.StandardRestore(abstract_state)
+                )
 
-        nnx.update(model, restored)
+            nnx.update(model, restored)
 
         return model

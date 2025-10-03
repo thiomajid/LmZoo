@@ -7,12 +7,35 @@ from einops import rearrange
 from flax import nnx
 from flax.nnx import initializers
 from flax.nnx.nn import dtypes
+from flax.typing import Shape
 from jax import lax
-from jax.sharding import Mesh
 from transformers import PretrainedConfig
 
-PositionEmbeddings = tuple[jax.Array, jax.Array]
-"""Cosine and sinus arrays for RoPE"""
+from src.common.sharding import BaseModelShardingConfig
+from src.common.types import PositionEmbeddings, ShardingRule
+
+
+# adapted from https://github.com/google/tunix/blob/main/tunix/models/qwen3/model.py
+class Einsum(nnx.Module):
+    """Einsum is a convenience module for parameterized tensor multiplication."""
+
+    def __init__(
+        self,
+        einsum_str: str,
+        shape: Shape,
+        *,
+        rngs: nnx.Rngs,
+        sharding: ShardingRule,
+    ):
+        self.einsum_str = einsum_str
+        self.shape = shape
+        self.kernel = nnx.Param(
+            nnx.initializers.normal()(rngs.params(), shape), sharding=sharding
+        )
+
+    @jax.named_scope("Einsum")
+    def __call__(self, x: jax.Array) -> jax.Array:
+        return jnp.einsum(self.einsum_str, x, self.kernel.value)
 
 
 class RMSNorm(nnx.Module):
@@ -20,16 +43,15 @@ class RMSNorm(nnx.Module):
         self,
         num_features: int,
         *,
-        mesh: Mesh,
         rngs: nnx.Rngs,
         dtype=jnp.bfloat16,
         param_dtype=jnp.float32,
         epsilon: float = 1e-6,
+        shardings=BaseModelShardingConfig.get_default_sharding(),
     ):
         scale_init = nnx.with_partitioning(
             initializers.ones_init(),
-            sharding=("tp",),
-            mesh=mesh,
+            sharding=shardings.rms_norm_weight,
         )
 
         self.scale = nnx.Param(scale_init(rngs(), (num_features,), param_dtype))
@@ -38,6 +60,7 @@ class RMSNorm(nnx.Module):
         self.dtype = dtype
         self.promote_dtype = dtypes.promote_dtype
 
+    @jax.named_scope("RMSNorm")
     def __call__(self, h_t: jax.Array):
         dtype = h_t.dtype
         h_t = h_t.astype(jnp.float32)
@@ -49,15 +72,15 @@ class RMSNorm(nnx.Module):
         return h_t.astype(dtype)
 
 
-class MLP(nnx.Module):
+class SwigluMLP(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
         *,
-        mesh: Mesh,
         rngs: nnx.Rngs,
         dtype=jnp.bfloat16,
         param_dtype=jnp.float32,
+        shardings=BaseModelShardingConfig.get_default_sharding(),
     ):
         hidden_size = config.hidden_size
         intermediate_size = config.intermediate_size
@@ -68,18 +91,38 @@ class MLP(nnx.Module):
             rngs=rngs,
             dtype=dtype,
             param_dtype=param_dtype,
+        )
+
+        self.gate_proj = Linear(
+            hidden_size,
+            intermediate_size,
             kernel_init=nnx.with_partitioning(
                 initializers.lecun_normal(),
-                sharding=(None, "tp"),
-                mesh=mesh,
+                sharding=shardings.ffn_up_proj,
             ),
         )
 
-        self.gate_proj = Linear(hidden_size, intermediate_size)
-        self.up_proj = Linear(hidden_size, intermediate_size)
-        self.down_proj = Linear(intermediate_size, hidden_size)
+        self.up_proj = Linear(
+            hidden_size,
+            intermediate_size,
+            kernel_init=nnx.with_partitioning(
+                initializers.lecun_normal(),
+                sharding=shardings.ffn_up_proj,
+            ),
+        )
+
+        self.down_proj = Linear(
+            intermediate_size,
+            hidden_size,
+            kernel_init=nnx.with_partitioning(
+                initializers.lecun_normal(),
+                sharding=shardings.ffn_down_proj,
+            ),
+        )
+
         self.act_fn = jax.nn.silu
 
+    @jax.named_scope("MLP")
     def __call__(self, x: jax.Array):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
@@ -125,10 +168,10 @@ class MultiHeadAttention(nnx.Module):
         config: PretrainedConfig,
         layer_idx: int,
         *,
-        mesh: Mesh,
         rngs: nnx.Rngs,
         dtype=jnp.bfloat16,
         param_dtype=jnp.float32,
+        shardings=BaseModelShardingConfig.get_default_sharding(),
     ):
         self.layer_idx = layer_idx
         self.head_dim = getattr(
@@ -149,32 +192,41 @@ class MultiHeadAttention(nnx.Module):
             rngs=rngs,
             dtype=dtype,
             param_dtype=param_dtype,
-            kernel_init=nnx.with_partitioning(
-                initializers.lecun_normal(),
-                sharding=(None, "tp"),
-                mesh=mesh,
-            ),
-            bias_init=nnx.with_partitioning(
-                initializers.zeros_init(),
-                sharding=("tp",),
-                mesh=mesh,
-            ),
         )
 
-        self.q_proj = Linear()
-        self.k_proj = Linear()
-        self.v_proj = Linear()
+        self.q_proj = Linear(
+            kernel_init=nnx.with_partitioning(
+                initializers.lecun_normal(),
+                sharding=shardings.attn_q_weight,
+            ),
+        )
+        self.k_proj = Linear(
+            kernel_init=nnx.with_partitioning(
+                initializers.lecun_normal(),
+                sharding=shardings.attn_kv_weight,
+            ),
+        )
+        self.v_proj = Linear(
+            kernel_init=nnx.with_partitioning(
+                initializers.lecun_normal(),
+                sharding=shardings.attn_kv_weight,
+            ),
+        )
 
         self.o_proj = Linear(
             in_features=config.num_attention_heads * self.head_dim,
             out_features=config.hidden_size,
+            kernel_init=nnx.with_partitioning(
+                initializers.lecun_normal(),
+                sharding=shardings.attn_o_weight,
+            ),
         )
 
         Norm = partial(
             RMSNorm,
             num_features=self.head_dim,
             epsilon=config.rms_norm_eps,
-            mesh=mesh,
+            shardings=shardings,
             rngs=rngs,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -243,32 +295,32 @@ class MultiHeadAttention(nnx.Module):
         return attn_output
 
 
-class DecoderLayer(nnx.Module):
+class TransformerDecoderLayer(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
         layer_idx: int,
         *,
-        mesh: Mesh,
         rngs: nnx.Rngs,
         dtype=jnp.bfloat16,
         param_dtype=jnp.float32,
+        shardings=BaseModelShardingConfig.get_default_sharding(),
     ):
         self.hidden_size = config.hidden_size
 
         self.self_attn = MultiHeadAttention(
             config=config,
             layer_idx=layer_idx,
-            mesh=mesh,
             rngs=rngs,
+            shardings=shardings,
             dtype=dtype,
             param_dtype=param_dtype,
         )
 
-        self.mlp = MLP(
+        self.mlp = SwigluMLP(
             config,
-            mesh=mesh,
             rngs=rngs,
+            shardings=shardings,
             dtype=dtype,
             param_dtype=param_dtype,
         )
@@ -277,8 +329,8 @@ class DecoderLayer(nnx.Module):
             RMSNorm,
             num_features=config.hidden_size,
             epsilon=config.rms_norm_eps,
-            mesh=mesh,
             rngs=rngs,
+            shardings=shardings,
             dtype=dtype,
             param_dtype=param_dtype,
         )
