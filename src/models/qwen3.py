@@ -33,13 +33,13 @@ class Qwen3ShardingConfig(BaseModelShardingConfig):
         fsdp = "fsdp" if not is_sampling else None
 
         return Qwen3ShardingConfig(
-            embedding=("tp", fsdp),
-            lm_head=(fsdp, "tp"),
-            attn_q_weight=("tp", fsdp, None),
-            attn_kv_weight=("tp", fsdp, None),
-            attn_o_weight=("tp", None, fsdp),
-            ffn_up_proj=(fsdp, "tp"),
-            ffn_down_proj=("tp", fsdp),
+            embedding=(fsdp, "tp"),
+            lm_head=("tp", fsdp),
+            attn_q_weight=(None, "tp"),
+            attn_kv_weight=(None, "tp"),
+            attn_o_weight=("tp", None),
+            ffn_up_proj=(None, "tp"),
+            ffn_down_proj=("tp", None),
             rms_norm_scale=("tp",),
             act_btd=("fsdp", None, None if is_sampling else "tp"),
             act_btf=("fsdp", None, "tp"),
