@@ -186,8 +186,6 @@ class MultiHeadAttention(nnx.Module):
 
         Linear = partial(
             nnx.Linear,
-            in_features=config.hidden_size,
-            out_features=config.num_attention_heads * self.head_dim,
             use_bias=config.attention_bias,
             rngs=rngs,
             dtype=dtype,
@@ -195,18 +193,26 @@ class MultiHeadAttention(nnx.Module):
         )
 
         self.q_proj = Linear(
+            in_features=config.hidden_size,
+            out_features=config.num_attention_heads * self.head_dim,
             kernel_init=nnx.with_partitioning(
                 initializers.lecun_normal(),
                 sharding=shardings.attn_q_weight,
             ),
         )
+
         self.k_proj = Linear(
+            in_features=config.hidden_size,
+            out_features=config.num_key_value_heads * self.head_dim,
             kernel_init=nnx.with_partitioning(
                 initializers.lecun_normal(),
                 sharding=shardings.attn_kv_weight,
             ),
         )
+
         self.v_proj = Linear(
+            in_features=config.hidden_size,
+            out_features=config.num_key_value_heads * self.head_dim,
             kernel_init=nnx.with_partitioning(
                 initializers.lecun_normal(),
                 sharding=shardings.attn_kv_weight,
