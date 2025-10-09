@@ -1,19 +1,22 @@
 import functools
-from typing import Tuple
 
 import jax
 import jax.numpy as jnp
-from flax import nnx
+from flax import nnx, struct
+
 
 # the model's State (its parameters and variables) must now be part of
 # the carry to be threaded through the scan loop correctly.
-GenerationCarry = Tuple[
-    jax.Array,  # The full sequence array being built
-    jax.Array,  # attention_mask
-    int,  # The current index to write the next token
-    jax.Array,  # The current PRNG key
-    nnx.State,  # The Pytree of the model's parameters
-]
+@struct.dataclass
+class GenerationCarry:
+    context: jax.Array
+    """The full sequence array being built"""
+    attention_mask: jax.Array
+    rng_key: jax.Array
+    model_state: nnx.State
+    """Pytree of the model's parameters"""
+    step: int
+    """The current index to write the next token"""
 
 
 @functools.partial(
@@ -22,12 +25,7 @@ GenerationCarry = Tuple[
 )
 def generate_sequence_scan(
     model: nnx.Module,
-    initial_carry_val: tuple[
-        jax.Array,
-        jax.Array,
-        int,
-        jax.Array,
-    ],  # initial carry from caller
+    carry: GenerationCarry,
     max_new_tokens: int,
     vocab_size: int,
     temperature: float = 1.0,
@@ -45,31 +43,23 @@ def generate_sequence_scan(
     # because it needs to create its own traced arrays
     graphdef, state = nnx.split(model)
 
-    # Augment the initial carry with the model's state
-    initial_full_carry: GenerationCarry = (
-        initial_carry_val[0],
-        initial_carry_val[1],
-        initial_carry_val[2],
-        initial_carry_val[3],
-        state,
-    )
-
     # define the body function for lax.scan inside the jiited function.
     # this allows it to form a closure over the static `graphdef`.
     def _generation_step_body(carry: GenerationCarry, _):
-        current_full_x, attention_mask, current_index, current_key, model_state = carry
-        step_key, next_key = jax.random.split(current_key)
+        step_key, next_key = jax.random.split(carry.rng_key)
 
         # reconstruct the model for this step by merging the
         # static graphdef with the current state from the carry.
-        model_for_step = nnx.merge(graphdef, model_state)
-        out = model_for_step(input_ids=current_full_x, attention_mask=attention_mask)
-        batch_size = current_full_x.shape[0]
+        model_for_step = nnx.merge(graphdef, carry.model_state)
+        out = model_for_step(
+            input_ids=carry.context, attention_mask=carry.attention_mask
+        )
+        batch_size = carry.context.shape[0]
 
         # --- Logit Selection ---
         logits_slice = jax.lax.dynamic_slice(
             out,
-            start_indices=(0, current_index - 1, 0),
+            start_indices=(0, carry.step - 1, 0),
             slice_sizes=(batch_size, 1, vocab_size),
         )
 
@@ -95,28 +85,27 @@ def generate_sequence_scan(
 
         # --- State Update ---
         updated_full_x = jax.lax.dynamic_update_slice(
-            current_full_x, next_token[:, None], (0, current_index)
+            carry.context, next_token[:, None], (0, carry.step)
         )
 
         # return the new carry, threading the (unchanged) model_state
         # through to the next iteration.
-        next_carry = (
-            updated_full_x,
-            attention_mask,
-            current_index + 1,
-            next_key,
-            model_state,
+        next_carry: GenerationCarry = carry.replace(
+            context=updated_full_x,
+            rng_key=next_key,
+            step=carry.step + 1,
         )
+
         return next_carry, next_token
 
     # --- Run the Scan ---
     final_carry, _ = jax.lax.scan(
         _generation_step_body,
-        initial_full_carry,  # augmented carry
+        carry,
         None,
         length=max_new_tokens,
     )
-    final_x = final_carry[0]
+    final_x = final_carry.context
     return final_x
 
 
@@ -148,11 +137,17 @@ class GenerationMixin:
         full_mask = jnp.ones_like(full_x_init, dtype=jnp.int32)
         full_mask = full_mask.at[:, :initial_sequence_length].set(attention_mask)
 
-        initial_carry_val = (full_x_init, full_mask, initial_sequence_length, key)
+        carry = GenerationCarry(
+            context=full_x_init,
+            attention_mask=full_mask,
+            rng_key=key,
+            model_state=nnx.state(self),
+            step=initial_sequence_length,
+        )
 
         return generate_sequence_scan(
             self,
-            initial_carry_val,
+            carry,
             max_new_tokens,
             self.vocab_size,
             temperature,
