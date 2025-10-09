@@ -2,6 +2,7 @@ import typing as tp
 from dataclasses import dataclass
 from functools import partial
 
+import chex
 import jax
 import jax.numpy as jnp
 from flax import nnx
@@ -9,8 +10,7 @@ from flax.nnx import initializers
 from flax.nnx.nn.linear import default_embed_init
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
-from src.common.model import ZooModel, stack_layers
-from src.common.modules import (
+from src.common.base_modules import (
     MultiHeadAttention,
     RMSNorm,
     RotaryEmbedding,
@@ -19,6 +19,7 @@ from src.common.modules import (
 )
 from src.common.sharding import BaseModelShardingConfig
 from src.common.types import ShardingRule
+from src.common.zoo_model import ZooModel, stack_layers
 from src.inference import GenerationMixin
 
 
@@ -191,11 +192,17 @@ class Qwen3Model(nnx.Module):
 
         self.has_sliding_layers = "sliding_attention" in config.layer_types
 
+    def position_ids_from_mask(self, attention_mask: jax.Array):
+        cumsum = jnp.cumsum(attention_mask, axis=-1) - 1  # shift by minus one
+        cumsum = cumsum * attention_mask
+        return cumsum
+
     @partial(jax.profiler.annotate_function, name="Qwen3Model")
     def __call__(
         self,
         input_ids: tp.Optional[jax.Array] = None,
         position_ids: tp.Optional[jax.Array] = None,
+        attention_mask: tp.Optional[jax.Array] = None,
         past_key_values: tp.Optional[nnx.Cache] = None,
         use_cache: tp.Optional[bool] = None,
         cache_position: tp.Optional[jax.Array] = None,
@@ -204,9 +211,12 @@ class Qwen3Model(nnx.Module):
 
         # for now do the computation without caching, we will handle that
         # later on, for now, we need the computation to be correct
+        if position_ids is None:
+            chex.assert_not_both_none(attention_mask, position_ids)
+            # position_ids = jnp.arange(0, hidden_states.shape[1])
+            # position_ids = jnp.expand_dims(position_ids, 0)
+            position_ids = self.position_ids_from_mask(attention_mask)
 
-        position_ids = jnp.arange(0, hidden_states.shape[1])
-        position_ids = jnp.expand_dims(position_ids, 0)
         position_embeddings = self.rotary_emb(position_ids)
 
         @nnx.scan(in_axes=(0, nnx.Carry), out_axes=nnx.Carry)
@@ -300,6 +310,7 @@ class Qwen3ForCausalLM(ZooModel, GenerationMixin):
     def __call__(
         self,
         input_ids: tp.Optional[jax.Array] = None,
+        attention_mask: tp.Optional[jax.Array] = None,
         position_ids: tp.Optional[jax.Array] = None,
         past_key_values: tp.Optional[nnx.Cache] = None,
         use_cache: tp.Optional[bool] = None,
@@ -309,6 +320,7 @@ class Qwen3ForCausalLM(ZooModel, GenerationMixin):
         hidden_states = self.model(
             input_ids=input_ids,
             position_ids=position_ids,
+            attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=use_cache,
             cache_position=cache_position,

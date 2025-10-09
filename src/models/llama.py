@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 import jax.numpy as jnp
 
-from src.common.modules import RMSNorm, RotaryEmbedding
+from src.common.base_modules import RMSNorm, RotaryEmbedding
 from src.common.sharding import BaseModelShardingConfig
 from src.common.types import ShardingRule
 

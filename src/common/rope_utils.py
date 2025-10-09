@@ -7,7 +7,7 @@ including default, linear scaling, dynamic NTK, YaRN, LongRoPE, and Llama3 varia
 
 import math
 import typing as tp
-from functools import wraps
+from functools import partial, wraps
 
 import jax
 import jax.numpy as jnp
@@ -361,6 +361,7 @@ def _dynamic_frequency_update(rope_module, position_ids):
         rope_module.max_seq_len_cached = seq_len
 
 
+@partial(jax.profiler.annotate_function, name="Dynamic RoPE Update")
 def dynamic_rope_update(rope_forward):
     """
     Decorator function to update the RoPE parameters in the forward pass, if the model is using a dynamic RoPE

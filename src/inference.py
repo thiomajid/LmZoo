@@ -9,6 +9,7 @@ from flax import nnx
 # the carry to be threaded through the scan loop correctly.
 GenerationCarry = Tuple[
     jax.Array,  # The full sequence array being built
+    jax.Array,  # attention_mask
     int,  # The current index to write the next token
     jax.Array,  # The current PRNG key
     nnx.State,  # The Pytree of the model's parameters
@@ -21,7 +22,12 @@ GenerationCarry = Tuple[
 )
 def generate_sequence_scan(
     model: nnx.Module,
-    initial_carry_val: tuple[jax.Array, int, jax.Array],  # initial carry from caller
+    initial_carry_val: tuple[
+        jax.Array,
+        jax.Array,
+        int,
+        jax.Array,
+    ],  # initial carry from caller
     max_new_tokens: int,
     vocab_size: int,
     temperature: float = 1.0,
@@ -44,19 +50,20 @@ def generate_sequence_scan(
         initial_carry_val[0],
         initial_carry_val[1],
         initial_carry_val[2],
+        initial_carry_val[3],
         state,
     )
 
     # define the body function for lax.scan inside the jiited function.
     # this allows it to form a closure over the static `graphdef`.
     def _generation_step_body(carry: GenerationCarry, _):
-        current_full_x, current_index, current_key, model_state = carry
+        current_full_x, attention_mask, current_index, current_key, model_state = carry
         step_key, next_key = jax.random.split(current_key)
 
         # reconstruct the model for this step by merging the
         # static graphdef with the current state from the carry.
         model_for_step = nnx.merge(graphdef, model_state)
-        out = model_for_step(current_full_x)
+        out = model_for_step(input_ids=current_full_x, attention_mask=attention_mask)
         batch_size = current_full_x.shape[0]
 
         # --- Logit Selection ---
@@ -116,6 +123,7 @@ class GenerationMixin:
         self,
         key: jax.Array,
         input_ids: jax.Array,
+        attention_mask: jax.Array,
         max_new_tokens: int,
         temperature: float = 0.6857,
         greedy: bool = False,
@@ -131,7 +139,7 @@ class GenerationMixin:
 
         full_x_init = full_x_init.at[:, :initial_sequence_length].set(input_ids)
 
-        initial_carry_val = (full_x_init, initial_sequence_length, key)
+        initial_carry_val = (full_x_init, attention_mask, initial_sequence_length, key)
 
         return generate_sequence_scan(
             self,
