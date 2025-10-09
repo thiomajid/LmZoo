@@ -100,7 +100,14 @@ def generate_sequence_scan(
 
         # return the new carry, threading the (unchanged) model_state
         # through to the next iteration.
-        return (updated_full_x, current_index + 1, next_key, model_state), next_token
+        next_carry = (
+            updated_full_x,
+            attention_mask,
+            current_index + 1,
+            next_key,
+            model_state,
+        )
+        return next_carry, next_token
 
     # --- Run the Scan ---
     final_carry, _ = jax.lax.scan(
@@ -133,13 +140,15 @@ class GenerationMixin:
         total_sequence_length = initial_sequence_length + max_new_tokens
 
         full_x_init = jnp.zeros(
-            shape=(batch_size, total_sequence_length),
-            dtype=jnp.int32,
+            shape=(batch_size, total_sequence_length), dtype=jnp.int32
         )
 
         full_x_init = full_x_init.at[:, :initial_sequence_length].set(input_ids)
 
-        initial_carry_val = (full_x_init, attention_mask, initial_sequence_length, key)
+        full_mask = jnp.ones_like(full_x_init, dtype=jnp.int32)
+        full_mask = full_mask.at[:, :initial_sequence_length].set(attention_mask)
+
+        initial_carry_val = (full_x_init, full_mask, initial_sequence_length, key)
 
         return generate_sequence_scan(
             self,
