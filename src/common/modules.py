@@ -11,6 +11,7 @@ from flax.typing import Shape
 from jax import lax
 from transformers import PretrainedConfig
 
+from src.common.rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from src.common.sharding import BaseModelShardingConfig
 from src.common.types import PositionEmbeddings, ShardingRule
 
@@ -60,7 +61,7 @@ class RMSNorm(nnx.Module):
         self.dtype = dtype
         self.promote_dtype = dtypes.promote_dtype
 
-    @jax.named_scope("RMSNorm")
+    @partial(jax.profiler.annotate_function, name="RMSNorm")
     def __call__(self, h_t: jax.Array):
         dtype = h_t.dtype
         h_t = h_t.astype(jnp.float32)
@@ -122,12 +123,13 @@ class SwigluMLP(nnx.Module):
 
         self.act_fn = jax.nn.silu
 
-    @jax.named_scope("MLP")
+    @partial(jax.profiler.annotate_function, name="SwigluMLP")
     def __call__(self, x: jax.Array):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
 
+@partial(jax.profiler.annotate_function, name="rotate_half")
 def rotate_half(x: jax.Array):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
@@ -135,6 +137,7 @@ def rotate_half(x: jax.Array):
     return jnp.concat((-x2, x1), axis=-1)
 
 
+@partial(jax.profiler.annotate_function, name="apply_rotary_pos_emb")
 def apply_rotary_pos_emb(
     q: jax.Array,
     k: jax.Array,
@@ -150,6 +153,7 @@ def apply_rotary_pos_emb(
     return q_embed, k_embed
 
 
+@partial(jax.profiler.annotate_function, name="repeat_kv")
 def repeat_kv(hidden_states: jax.Array, n_rep: int) -> jax.Array:
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
@@ -251,7 +255,7 @@ class MultiHeadAttention(nnx.Module):
         self.param_dtype = param_dtype
         self.promote_dtype = dtypes.promote_dtype
 
-    @jax.named_scope("MultiHeadAttention")
+    @partial(jax.profiler.annotate_function, name="MultiHeadAttention")
     def __call__(
         self,
         hidden_states: jax.Array,
@@ -346,7 +350,7 @@ class TransformerDecoderLayer(nnx.Module):
         self.post_attention_layernorm = Norm()
         self.attention_type = config.layer_types[layer_idx]
 
-    @jax.named_scope("TransformerDecoderLayer")
+    @partial(jax.profiler.annotate_function, name="TransformerDecoderLayer")
     def __call__(
         self,
         hidden_states: jax.Array,
@@ -385,25 +389,30 @@ class RotaryEmbedding(nnx.Module):
         dtype=jnp.bfloat16,
         param_dtype=jnp.float32,
     ):
-        self.dim = getattr(
-            config,
-            "head_dim",
-            config.hidden_size // config.num_attention_heads,
-        )
+        # BC: "rope_type" was originally "type"
+        if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
+            self.rope_type = config.rope_scaling.get(
+                "rope_type", config.rope_scaling.get("type")
+            )
+        else:
+            self.rope_type = "default"
 
-        self.max_position_embeddings = config.max_position_embeddings
-        self.base = config.rope_theta
+        self.max_seq_len_cached: int = nnx.data(config.max_position_embeddings)
+        self.original_max_seq_len: int = nnx.data(config.max_position_embeddings)
+
+        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+
+        # Compute initial parameters
+        inv_freq, attention_scaling = self.rope_init_fn(config)
+        self.inv_freq: jax.Array = nnx.data(inv_freq)
+        self.original_inv_freq: jax.Array = nnx.data(self.inv_freq)
+        self.attention_scaling: float = nnx.data(attention_scaling)
+
         self.dtype = dtype
         self.param_dtype = param_dtype
 
-        inv_freq = 1.0 / (
-            self.base ** (jnp.arange(0, self.dim, 2, dtype=jnp.float32) / self.dim)
-        )
-
-        # Store as a non-trainable buffer
-        self.inv_freq = inv_freq
-
-    @jax.named_scope("RoPE")
+    @partial(jax.profiler.annotate_function, name="RoPE")
+    @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
     def __call__(self, position_ids: jax.Array):
         # position_ids: [batch_size, seq_len]
         t = position_ids.astype(self.inv_freq.dtype)
@@ -413,7 +422,7 @@ class RotaryEmbedding(nnx.Module):
         emb = jnp.concatenate((freqs, freqs), axis=-1)
 
         # cos/sin: [batch_size, seq_len, dim]
-        cos = jnp.cos(emb).astype(self.dtype)
-        sin = jnp.sin(emb).astype(self.dtype)
+        cos = jnp.cos(emb) * self.attention_scaling
+        sin = jnp.sin(emb) * self.attention_scaling
 
-        return cos, sin
+        return cos.astype(self.dtype), sin.astype(self.dtype)

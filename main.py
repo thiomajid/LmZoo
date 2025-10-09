@@ -1,7 +1,4 @@
 import jax
-from huggingface_hub import upload_file
-
-upload_file(repo_id="", path_or_fileobj="", path_in_repo="", token="")
 
 if __name__ == "__main__":
     with jax.profiler.trace("./logs"):

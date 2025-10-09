@@ -1,5 +1,6 @@
 import typing as tp
 from dataclasses import dataclass
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -19,7 +20,6 @@ from src.common.modules import (
 from src.common.sharding import BaseModelShardingConfig
 from src.common.types import ShardingRule
 from src.inference import GenerationMixin
-
 
 
 # adapted from https://github.com/google/tunix/blob/main/tunix/models/llama3/model.py
@@ -191,7 +191,7 @@ class Qwen3Model(nnx.Module):
 
         self.has_sliding_layers = "sliding_attention" in config.layer_types
 
-    @jax.named_scope("Qwen3Model")
+    @partial(jax.profiler.annotate_function, name="Qwen3Model")
     def __call__(
         self,
         input_ids: tp.Optional[jax.Array] = None,
@@ -296,7 +296,7 @@ class Qwen3ForCausalLM(ZooModel, GenerationMixin):
             ),
         )
 
-    @jax.named_scope("Qwen3ForCausalLM")
+    @partial(jax.profiler.annotate_function, name="Qwen3ForCausalLM")
     def __call__(
         self,
         input_ids: tp.Optional[jax.Array] = None,
